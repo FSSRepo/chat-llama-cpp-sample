@@ -10,80 +10,29 @@ const io = new Server(server);
 
 io.on("connection", (socket) => {
     socket.on("disconnect", (reason) => {
+
     });
 });
 
 let vicuna_mode = {
-    instructions: [
-        { role: "system", content: "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions." },
-        { role: "user", content: "Hello, Assistant." },
-        { role: "assistant", content: "Hello. How may I help you today?" },
-        { role: "user", content: "Please tell me the largest city in Europe." },
-        { role: "assistant", content: "Sure. The largest city in Europe is Moscow, the capital of Russia." }
+    chat_prompt: [
+        { user: "Hello, Assistant.",
+          assistant: "Hello. How may I help you today?"  },
+        { user: "Please tell me the largest city in Europe.",
+          assistant: "Sure. The largest city in Europe is Moscow, the capital of Russia." }
     ],
-
-    build_prompt: () => {
-        let prompt = '';
-        for(let inst of vicuna_mode.instructions) {
-            if(inst.role == "system") {
-                prompt += inst.content + '\n\n';
-            } else if(inst.role == "user") {
-                prompt += '### Human: '  + inst.content + '\n';
-            } else if(inst.role == "assistant") {
-                prompt += '### Assistant: '  + inst.content + '\n';
-            }
-        }
-        for(let ctx of context) {
-            if(ctx.role == "user") {
-                prompt += '### Human: '  + ctx.content + '\n';
-            } else if(ctx.role == "assistant") {
-                prompt += '### Assistant: '  + ctx.content;
-            }
-        }
+    gen_prompt: (user_req) => {
+        let prompt = "A chat between a curious human and an artificial intelligence assistant. " +
+        "The assistant gives helpful, detailed, and polite answers to the human's questions.\n\n";
+        prompt += vicuna_mode.chat_prompt.map(chat => '### Human: '  + chat.user + '\n### Assistant: '  + chat.assistant).join('\n');
+        prompt += chat_context.map(chat => '### Human: '  + chat.user + '\n### Assistant: '  + chat.assistant).join('\n');
+        prompt += '### Human: '  + user_req + '\n### Assistant:';
         return prompt;
     },
     stop_words: ["### Human:"],
-    exclude_words: ["### Assistant:"]
 }
 
-let pygmalion_mode = {
-    instructions: [
-        { role: "system", content: "Assistant's Persona: Assistant is a highly intelligent language model trained to comply with user requests." },
-        { role: "user", content: "Hello, Assistant." },
-        { role: "assistant", content: "Hello. How may I help you today?" },
-        { role: "user", content: "Please tell me the largest city in Europe." },
-        { role: "assistant", content: "Sure. The largest city in Europe is Moscow, the capital of Russia." }
-    ],
-
-    build_prompt: () => {
-        let prompt = "";
-        for (let inst of pygmalion_mode.instructions) {
-          if (inst.role == "system") {
-            prompt += inst.content + "\n\n";
-          } else if (inst.role == "user") {
-            prompt += "You: " + inst.content + "\n";
-          } else if (inst.role == "assistant") {
-            prompt += "Assistant: " + inst.content + "\n";
-          }
-        }
-        for (let ctx of context) {
-          if (ctx.role == "user") {
-            prompt += "You: " + ctx.content + "\n";
-          } else if (ctx.role == "assistant") {
-            prompt += "Assistant:" + ctx.content;
-          }
-        }
-        prompt += "Assistant:";
-        return prompt;
-    },
-    stop_words: ["You:"],
-    exclude_words: []
-}
-
-let context = [];
-
-// CHANGE THIS: examples modes vicuna and pygmalion
-let model_config = pygmalion_mode; // vicuna_mode
+let chat_context = [];
 
 app.use(cors());
 
@@ -91,41 +40,37 @@ app.use(express.json());
 app.use(express.static('./public'));
 
 app.post('/send',async (req, res) => {
+    const question = req.body.text;
     let message_result = '';
-    context.push({ role: "user", content: req.body.text });
     let result = await axios.post("http://127.0.0.1:8080/completion", {
-      prompt: model_config.build_prompt(),
-      batch_size: 128,
+      prompt: vicuna_mode.gen_prompt(question),
       temperature: 0.2,
       top_k: 40,
       top_p: 0.9,
-      n_keep: -1,
-      n_predict: 2048,
-      stop: model_config.stop_words, // when detect this, stop completion
-      exclude: model_config.exclude_words, // no show in the completion
-      threads: 8,
-      as_loop: true,
-      interactive: true, // default mode is generation
+      n_keep: 29,
+      n_predict: 512,
+      stop: vicuna_mode.stop_words, // when detect this, stop completion
+      stream: true,
+    }, {
+      responseType: 'stream'
     });
-    while (true) {
-      let completion = (await axios.get("http://127.0.0.1:8080/next-token"))
-        .data;
-      io.to(req.body.socket_id).emit(
-        "message-stream",
-        completion.content
-      );
-      message_result += completion.content;
-      if (completion.stop) {
-        io.to(req.body.socket_id).emit("message-stream", "stop-chat");
-        context.push({ role: "assistant", content: message_result });
-        break;
+    result.data.on('data', (chunk) => {
+      const t = Buffer.from(chunk).toString("utf8");
+      if (t.startsWith("data: ")) {
+        const completion = JSON.parse(t.substring(6));
+        io.to(req.body.socket_id).emit("message-stream", completion.content);
+        message_result += completion.content;
+        if (completion.stop) {
+          io.to(req.body.socket_id).emit("message-stream", "stop-chat");
+          chat_context.push({ user: completion.content, assistant: message_result });
+        }
       }
-    }
+    })
     res.send({});
 });
 
 app.get('/reset',async (req, res) => {
-    context = [];
+  chat_context = [];
     console.log("Context cleanup");
     res.send({ status: "done" });
 });
